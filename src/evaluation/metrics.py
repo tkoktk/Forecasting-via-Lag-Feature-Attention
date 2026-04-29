@@ -19,6 +19,8 @@ def compute_metrics(y_true, y_pred):
     mae = float(np.abs(df["y"] - df["yhat"]).mean())
     rmse = float(np.sqrt(((df["y"] - df["yhat"]) ** 2).mean()))
 
-    print(f"IC={ic:.4f} (p={p_value:.4f}), DirAcc={diracc:.4f}, MAE={mae:.6f}, RMSE={rmse:.6f}")
+    print(
+        f"IC={ic:.4f} (p={p_value:.4f}), DirAcc={diracc:.4f}, MAE={mae:.6f}, RMSE={rmse:.6f}"
+    )
 
     return {"ic": ic, "p_value": p_value, "diracc": diracc, "mae": mae, "rmse": rmse}

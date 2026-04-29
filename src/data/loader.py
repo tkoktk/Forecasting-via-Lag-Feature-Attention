@@ -34,7 +34,7 @@ def download_prices(tickers, start, end):
 def format_prices(prices_df):
     prices_df = prices_df.copy()
 
-    # Set Date as the index 
+    # Set Date as the index
     prices_df["Date"] = pd.to_datetime(prices_df["Date"]).dt.tz_localize(None)
     prices_df = prices_df.set_index("Date")
     # Set to 'date'
@@ -70,5 +70,7 @@ def get_ticker_data(prices_df, ticker):
     ticker_data.index = pd.to_datetime(ticker_data.index)
     ticker_data = ticker_data.sort_index()
 
-    print(f"{ticker}: {len(ticker_data)} rows, {ticker_data.index[0].date()} to {ticker_data.index[-1].date()}")
+    print(
+        f"{ticker}: {len(ticker_data)} rows, {ticker_data.index[0].date()} to {ticker_data.index[-1].date()}"
+    )
     return ticker_data

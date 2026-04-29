@@ -1,0 +1,15 @@
+pyproject.toml
+forecasting_via_lag_feature_attention.egg-info/PKG-INFO
+forecasting_via_lag_feature_attention.egg-info/SOURCES.txt
+forecasting_via_lag_feature_attention.egg-info/dependency_links.txt
+forecasting_via_lag_feature_attention.egg-info/top_level.txt
+src/__init__.py
+src/data/__init__.py
+src/data/features.py
+src/data/loader.py
+src/evaluation/__init__.py
+src/evaluation/metrics.py
+src/evaluation/walk_forward.py
+src/models/__init__.py
+src/models/ridge_baseline.py
+src/visualisation/__init__.py
