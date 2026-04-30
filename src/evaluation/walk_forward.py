@@ -39,8 +39,6 @@ def walk_forward(prices, config, horizon=5, step=10):
     y_full.name = "y_true"
     test_dates = y_full.dropna().index
 
-    print(f"Walk-forward: {len(test_dates)} test dates, step={step}, horizon={horizon}")
-
     all_preds = []
 
     for i in range(0, len(test_dates), step):
@@ -63,7 +61,6 @@ def walk_forward(prices, config, horizon=5, step=10):
     )
     y_true = y_full.reindex(y_pred.index)
 
-    print(f"Walk-forward complete: {len(y_pred)} predictions generated")
     return y_true, y_pred
 
 
@@ -78,6 +75,10 @@ def run_evaluation(
     verbose=True,
     return_predictions=False,
 ):
+    """Evaluate multiple forecasting configurations across tickers using walk-forward validation.
+    For each configuration and ticker combination, performs walk-forward validatio
+    and computes directional accuracy, MAE, and RMSE metrics.
+    """
     results = []
 
     for config_name, config_params in configs.items():

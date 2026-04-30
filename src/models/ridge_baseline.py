@@ -101,9 +101,6 @@ class Forecaster:
             .replace([np.inf, -np.inf], np.nan)
             .dropna()
         )
-        print(
-            f"Features constructed: {feature_df.shape[1]} columns, {len(feature_df)} rows after dropna"
-        )
         return feature_df
 
     def _get_model(self, alpha=None):
@@ -163,8 +160,6 @@ class Forecaster:
                 best_mse, best_alpha = avg_mse, alpha
 
         self.best_alpha_ = float(best_alpha or 1.0)
-        print(f"Best alpha: {self.best_alpha_} (CV MSE={best_mse:.6f})")
-
         self.pipe_ = Pipeline(
             [
                 ("scaler", StandardScaler()),

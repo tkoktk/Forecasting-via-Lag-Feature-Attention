@@ -7,8 +7,6 @@ def compute_metrics(y_true, y_pred):
     df = pd.concat([y_true.rename("y"), y_pred.rename("yhat")], axis=1)
     df = df.replace([np.inf, -np.inf], np.nan).dropna()
 
-    print(f"Computing metrics on {len(df)} valid observations")
-
     if df.empty:
         print("WARNING: No valid observations after alignment and NaN removal")
         return {"ic": np.nan, "diracc": np.nan, "mae": np.nan, "rmse": np.nan}
