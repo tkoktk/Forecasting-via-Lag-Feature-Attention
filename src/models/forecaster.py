@@ -1,78 +1,231 @@
-import torch.nn as nn
-from src.models.tokeniser import LagFeatureTokeniser
-from src.models.attention import LatentQueryAttention
+import numpy as np
+import pandas as pd
+
+from src.data.features import log_returns, forward_log_return, parkinson_volatility
 
 
-def build_head(input_dim, head_config=None):
-    print(f"Building head | input_dim={input_dim}")
+class Forecaster:
+    """Parent class - carries main forecaster functionality including building features from a config dict"""
 
-    if head_config is None or head_config.get("type") == "linear":
-        return nn.Linear(input_dim, 1)
+    def __init__(self, config: dict):
+        self.n_lags = int(config.get("n_lags", 5))
+        self.parkinson_vol_windows = tuple(config.get("parkinson_vol_windows", ()))
+        self.min_train_points = int(config.get("min_train_points", 200))
+        self.config = config
 
-    if head_config.get("type") == "mlp":
-        hidden_dim = head_config.get("hidden_dim", 32)
-        print(f"Using mlp head with hidden_dim={hidden_dim}")
-        return nn.Sequential(
-            nn.Linear(input_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1)
+        print()
+        print(
+            f"\n{self.__class__.__name__} | n_lags={self.n_lags}, pvol_windows={self.parkinson_vol_windows}"
         )
 
-    raise ValueError(f"Unknown head type: {head_config.get('type')}")
+    def _make_features(self, prices: pd.DataFrame) -> pd.DataFrame:
+        """
+        Constructs a feature matrix (for example of lagged log returns) from raw OHLC Data.
+        Feature construction is dependent on the config passed in.
 
+        To prevent look-ahead bias in our walk forward, features are shifted to use information available strictly before time t.
 
-class LagFeatureForecaster(nn.Module):
-    """
-    Wires the tokeniser.py and attention.py together
-    Then applies a small MLP head to produce
-        ŷ_{t+h}
+        Args:
+            X: OHLC DataFrame with at least a ``Close`` column.
+            ``High`` and ``Low`` are required if ``parkinson_vol_windows`` is set.
+            Indexed by date.
 
-    """
+        Returns:
+            Feature matrix with one column per feature and a DatetimeIndex aligned to ``X``.
+            Rows containing any NaN are dropped, so the returned index is a strict subset of ``X.index``.
 
-    def __init__(
-        self, num_lags, num_features, embed_dim=32, num_queries=4, head_config=None
-    ):
-        super().__init__()
+        Notes:
+            Returns an empty DataFrame (with X's index) when no features are configured. This keeps the downstream ``fit`` logic uniform: it
+            falls back to a DummyRegressor rather than raising.
+        """
 
-        if head_config is None:
-            head_config = {"type": "mlp", "hidden_dim": 32}
+        close = prices["Close"].astype(float)
+        ret = log_returns(close)
 
-        self.num_lags = num_lags
-        self.num_features = num_features
-        self.embed_dim = embed_dim
-        self.num_queries = num_queries
+        feats = {}
 
-        self.tokeniser = LagFeatureTokeniser(
-            num_lags=num_lags, num_features=num_features, embed_dim=embed_dim
+        pvol_series = {}
+        if self.parkinson_vol_windows:
+            missing = [c for c in ["High", "Low"] if c not in prices.columns]
+            if missing:
+                raise ValueError(
+                    f"_make_features: columns {missing} required for Parkinson vol but not found"
+                )
+
+            for w in self.parkinson_vol_windows:
+                pvol_series[w] = parkinson_volatility(prices["High"], prices["Low"], w)
+
+        for lag in range(1, self.n_lags + 1):
+            feats[f"ret_lag{lag}"] = ret.shift(lag)
+            for w, pvol in pvol_series.items():
+                feats[f"pvol_{w}_lag{lag}"] = pvol.shift(lag)
+
+        if not feats:
+            print("WARNING: no features configured, returning empty DataFrame")
+            return pd.DataFrame(index=prices.index)
+
+        feature_df = (
+            pd.DataFrame(feats, index=prices.index)
+            .replace([np.inf, -np.inf], np.nan)
+            .dropna()
         )
 
-        self.attention = LatentQueryAttention(
-            embed_dim=embed_dim, num_queries=num_queries
+        print(
+            f"_make_features | shape={feature_df.shape}, columns={list(feature_df.columns)}"
+        )
+        return feature_df
+
+    def build_features(
+        self, prices: pd.DataFrame, horizon: int
+    ) -> tuple[np.ndarray, np.ndarray, pd.DatetimeIndex]:
+        """
+        Constructs (X, y, dates) from raw OHLCV prices.
+
+        X has shape (N, L, F) where:
+            N = number of valid samples
+            L = n_lags
+            F = number of features (1 for lags only, 2+ with volatility)
+
+        Args:
+            prices: DataFrame with at least a Close column.
+            horizon: Forecast horizon h. Target is the h-day forward log return.
+
+        Returns:
+            X:     np.ndarray of shape (N, L, F)
+            y:     np.ndarray of shape (N,)
+            dates: pd.DatetimeIndex of length N
+        """
+        print(f"build_features | horizon={horizon}")
+
+        feature_df = self._make_features(prices)
+        target = forward_log_return(prices["Close"].astype(float), horizon).rename(
+            "target"
         )
 
-        head_input_dim = num_queries * embed_dim
-        self.head = build_head(head_input_dim, head_config)
+        combined = pd.concat([feature_df, target], axis=1).dropna()
 
-        total_params = sum(p.numel() for p in self.parameters())
-        print(f"LagFeatureForecaster init")
-        print(f"  num_lags={num_lags}, num_features={num_features}")
-        print(f"  embed_dim={embed_dim}, num_queries={num_queries}")
-        print(f"  head_config={head_config}")
-        print(f"  head_input_dim={head_input_dim}")
-        print(f"  total trainable params: {total_params}")
+        n_features = 1 + len(self.parkinson_vol_windows)
+        X = combined.drop(columns="target").values.reshape(
+            len(combined), self.n_lags, n_features
+        )
+        y = combined["target"].values
+        dates = combined.index
 
-    def forward(self, x):
-        print(f"Forecaster forward | input shape: {x.shape}")
+        print(f"build_features | X={X.shape}, y={y.shape}")
+        print(f"  date range: {dates[0].date()} to {dates[-1].date()}")
+        print(f"  y mean={y.mean():.6f}, std={y.std():.6f}")
 
-        tokens = self.tokeniser(x)
-        Z, A = self.attention(tokens)
+        return X, y, dates
 
-        print(f"  Z shape: {Z.shape}")
+    def fit(self, X_train: np.ndarray, y_train: np.ndarray) -> "Forecaster":
+        raise NotImplementedError(f"{self.__class__.__name__} must implement fit()")
 
-        z_flat = Z.reshape(x.shape[0], -1)
+    def predict(self, X_test: np.ndarray) -> np.ndarray:
+        raise NotImplementedError(f"{self.__class__.__name__} must implement predict()")
 
-        print(f"  z_flat shape: {z_flat.shape}")
 
-        y_hat = self.head(z_flat)
+# class Forecaster:
+#     """Parent class - carries main forecaster functionality including building features from a config dict"""
 
-        print(f"  y_hat shape: {y_hat.shape}")
+#     def __init__(self, config: dict):
+#         self.n_lags = int(config.get("n_lags", 5))
+#         self.parkinson_vol_windows = tuple(config.get("parkinson_vol_windows", ()))
+#         self.min_train_points = int(config.get("min_train_points", 200))
+#         self.config = config
 
-        return y_hat, A
+#     def _make_features(self, prices: pd.DataFrame) -> pd.DataFrame:
+#         """
+#         Constructs a feature matrix (for example of lagged log returns) from raw OHLC Data.
+#         Feature construction is dependent on the config passed in.
+
+#         To prevent look-ahead bias in our walk forward, features are shifted to use information available strictly before time t.
+
+#         Args:
+#             X: OHLC DataFrame with at least a ``Close`` column.
+#             ``High`` and ``Low`` are required if ``parkinson_vol_windows`` is set.
+#             Indexed by date.
+
+#         Returns:
+#             Feature matrix with one column per feature and a DatetimeIndex aligned to ``X``.
+#             Rows containing any NaN are dropped, so the returned index is a strict subset of ``X.index``.
+
+#         Notes:
+#             Returns an empty DataFrame (with X's index) when no features are configured. This keeps the downstream ``fit`` logic uniform: it
+#             falls back to a DummyRegressor rather than raising.
+#         """
+
+#         close = prices["Close"].astype(float)
+#         ret = log_returns(close)
+
+#         feats = {}
+
+#         for lag in range(1, self.n_lags + 1):
+#             feats[f"ret_lag{lag}"] = ret.shift(lag)
+
+#         if self.parkinson_vol_windows:
+#             missing = [c for c in ["High", "Low"] if c not in prices.columns]
+#             if missing:
+#                 raise ValueError(
+#                     f"_make_features: columns {missing} required for Parkinson vol but not found"
+#                 )
+
+#             for w in self.parkinson_vol_windows:
+#                 feats[f"pvol_{w}"] = parkinson_volatility(
+#                     prices["High"], prices["Low"], w
+#                 ).shift(1)
+
+#         if not feats:
+#             print("WARNING: no features in config, returning empty DataFrame")
+#             return pd.DataFrame(index=prices.index)
+
+#         feature_df = (
+#             pd.DataFrame(feats, index=prices.index)
+#             .replace([np.inf, -np.inf], np.nan)
+#             .dropna()
+#         )
+
+#         return feature_df
+
+#     def build_features(
+#         self, prices: pd.DataFrame, horizon: int
+#     ) -> tuple[np.ndarray, np.ndarray, pd.DatetimeIndex]:
+#         """
+#         Constructs (X, y, dates) from raw OHLCV prices.
+
+#         X has shape (N, L, F) where:
+#             N = number of valid samples
+#             L = n_lags
+#             F = number of features (1 for lags only, 2+ with volatility)
+
+#         Args:
+#             prices: DataFrame with at least a Close column.
+#             horizon: Forecast horizon h. Target is the h-day forward log return.
+
+#         Returns:
+#             X:     np.ndarray of shape (N, L, F)
+#             y:     np.ndarray of shape (N,)
+#             dates: pd.DatetimeIndex of length N
+#         """
+
+#         feature_df = self._make_features(prices)
+#         target = forward_log_return(prices["Close"].astype(float), horizon).rename(
+#             "target"
+#         )
+
+#         combined = pd.concat([feature_df, target], axis=1).dropna()
+
+#         n_features = 1 + len(self.parkinson_vol_windows)
+#         X = combined.drop(columns="target").values.reshape(
+#             len(combined), self.n_lags, n_features
+#         )
+#         y = combined["target"].values
+#         dates = combined.index
+
+#         return X, y, dates
+
+#     # This is a base class only. Each subclass will override fit() and predict() according to the model
+#     def fit(self, X_train: np.ndarray, y_train: np.ndarray) -> "Forecaster":
+#         raise NotImplementedError(f"{self.__class__.__name__} must implement fit()")
+
+#     def predict(self, X_test: np.ndarray) -> np.ndarray:
+#         raise NotImplementedError(f"{self.__class__.__name__} must implement predict()")

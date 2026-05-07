@@ -1,68 +1,164 @@
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.preprocessing import StandardScaler
+
+from src.models.forecaster import Forecaster
+from src.models.lag_feature_forecaster import LagFeatureForecaster
 
 
-class LatentQueryAttention(nn.Module):
-    """
-    We take U_t : R^{(L . F) x d}
-    and produce
-        Z_t : R^{m x d_v}
-        plus attention weights:
-        A_t : R^{m x (L . F)}
-    """
+SEED = 40304451
+DEFAULT_BATCH_SIZE = 32
+DEFAULT_MAX_EPOCHS = 100
+DEFAULT_PATIENCE = 10
+DEFAULT_LEARNING_RATE = 1e-3
+DEFAULT_GRAD_CLIP = 1.0
 
-    def __init__(self, embed_dim, num_queries, d_k=None, d_v=None):
-        super().__init__()
 
-        self.embed_dim = embed_dim
-        self.num_queries = num_queries
-        self.d_k = d_k if d_k is not None else embed_dim
-        self.d_v = d_v if d_v is not None else embed_dim
+class AttentionForecaster(Forecaster):
+    def __init__(self, config: dict):
+        super().__init__(config)
+        self.embed_dim = int(config.get("embed_dim", 32))
+        self.num_queries = int(config.get("num_queries", 4))
+        self.batch_size = int(config.get("batch_size", DEFAULT_BATCH_SIZE))
+        self.max_epochs = int(config.get("max_epochs", DEFAULT_MAX_EPOCHS))
+        self.patience = int(config.get("patience", DEFAULT_PATIENCE))
+        self.learning_rate = float(config.get("learning_rate", DEFAULT_LEARNING_RATE))
+        self.grad_clip = float(config.get("grad_clip", DEFAULT_GRAD_CLIP))
+        self.train_fraction = float(config.get("train_fraction", 0.8))
 
-        self.W_K = nn.Linear(embed_dim, self.d_k, bias=False)
-        self.W_V = nn.Linear(embed_dim, self.d_v, bias=False)
-        self.W_Q = nn.Linear(embed_dim, self.d_k, bias=False)
+        self.model_ = None
+        self.scaler_ = None
+        self.fitted_ = False
 
-        self.Q_latent = nn.Parameter(torch.randn(num_queries, embed_dim))
+    def _fit_scaler(self, X_train: np.ndarray) -> StandardScaler:
+        n, L, F = X_train.shape
+        scaler = StandardScaler()
+        scaler.fit(X_train.reshape(n, L * F))
+        return scaler
+
+    def _apply_scaler(self, X: np.ndarray) -> np.ndarray:
+        n, L, F = X.shape
+        X_scaled = self.scaler_.transform(X.reshape(n, L * F))
+        return X_scaled.reshape(n, L, F)
+
+    def _make_dataloader(self, X: np.ndarray, y: np.ndarray) -> DataLoader:
+        X_tensor = torch.tensor(X, dtype=torch.float32)
+        y_tensor = torch.tensor(y, dtype=torch.float32).unsqueeze(1)
+        return DataLoader(
+            TensorDataset(X_tensor, y_tensor), batch_size=self.batch_size, shuffle=False
+        )
+
+    def _time_split(self, X: np.ndarray, y: np.ndarray) -> tuple:
+        split_idx = int(len(X) * self.train_fraction)
+        return X[:split_idx], X[split_idx:], y[:split_idx], y[split_idx:]
+
+    def _run_training_loop(
+        self, model: nn.Module, train_loader: DataLoader, val_loader: DataLoader
+    ) -> nn.Module:
+        optimiser = torch.optim.Adam(model.parameters(), lr=self.learning_rate)
+        loss_fn = nn.MSELoss()
+
+        best_val_loss = float("inf")
+        best_weights = None
+        epochs_without_improvement = 0
 
         print(
-            f"  embed_dim={embed_dim}, num_queries={num_queries}, d_k={self.d_k}, d_v={self.d_v}"
+            f"  training | max_epochs={self.max_epochs}, patience={self.patience}, lr={self.learning_rate}"
         )
-        print(f"W_K params: {sum(p.numel() for p in self.W_K.parameters())}")
-        print(f"W_V params: {sum(p.numel() for p in self.W_V.parameters())}")
-        print(f"W_Q params: {sum(p.numel() for p in self.W_Q.parameters())}")
-        print(f"Q_latent params: {self.Q_latent.numel()}")
 
-    def forward(self, tokens):
-        print(f"LatentQueryAttention forward | tokens shape: {tokens.shape}")
+        for epoch in range(self.max_epochs):
+            model.train()
+            train_losses = []
+            for X_batch, y_batch in train_loader:
+                optimiser.zero_grad()
+                y_hat, _ = model(X_batch)
+                loss = loss_fn(y_hat, y_batch)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), self.grad_clip)
+                optimiser.step()
+                train_losses.append(loss.item())
 
-        K = self.W_K(tokens)
-        V = self.W_V(tokens)
+            model.eval()
+            val_losses = []
+            with torch.no_grad():
+                for X_batch, y_batch in val_loader:
+                    y_hat, _ = model(X_batch)
+                    loss = loss_fn(y_hat, y_batch)
+                    val_losses.append(loss.item())
 
-        Q = self.W_Q(self.Q_latent)
+            train_loss = np.mean(train_losses)
+            val_loss = np.mean(val_losses)
 
-        print(f"K shape: {K.shape}")
-        print(f"V shape: {V.shape}")
-        print(f"Q shape: {Q.shape}")
+            if (epoch + 1) % 10 == 0:
+                print(
+                    f"  epoch {epoch + 1:>3} | train_loss={train_loss:.6f} | val_loss={val_loss:.6f} | no_improve={epochs_without_improvement}"
+                )
 
-        # Scaling keeps the dot products in a reasonable size to prevent saturating softmax
-        scale = self.d_k**0.5
-        # K has shape (batch, L*F, d_k)
-        # Q has shape (m, d_k)
-        # but with pytorch Q here is treated as (1, m, d_k) for the multiply
-        # hence we transpose only the last two dimensions of K
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / scale
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_weights = {k: v.clone() for k, v in model.state_dict().items()}
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
 
-        print(f"  scores shape: {scores.shape}")
+            if epochs_without_improvement >= self.patience:
+                print(
+                    f"  early stopping at epoch {epoch + 1} | best_val_loss={best_val_loss:.6f}"
+                )
+                break
 
-        A = F.softmax(scores, dim=-1)
+        model.load_state_dict(best_weights)
+        print(f"  training complete | best_val_loss={best_val_loss:.6f}")
+        return model
 
-        print(f"A shape: {A.shape}")
-        print(f"A sum across tokens (should be 1.0): {A[0].sum(dim=-1).detach()}")
+    def fit(self, X_train: np.ndarray, y_train: np.ndarray) -> "AttentionForecaster":
 
-        Z = torch.matmul(A, V)
+        n, L, F = X_train.shape
 
-        print(f"Z shape: {Z.shape}")
+        X_tr, X_val, y_tr, y_val = self._time_split(X_train, y_train)
 
-        return Z, A
+        self.scaler_ = self._fit_scaler(X_tr)
+        X_tr_scaled = self._apply_scaler(X_tr)
+        X_val_scaled = self._apply_scaler(X_val)
+
+        train_loader = self._make_dataloader(X_tr_scaled, y_tr)
+        val_loader = self._make_dataloader(X_val_scaled, y_val)
+
+        torch.manual_seed(SEED)
+        self.model_ = LagFeatureForecaster(
+            num_lags=L,
+            num_features=F,
+            embed_dim=self.embed_dim,
+            num_queries=self.num_queries,
+            head_config=self.config.get("head_config", None),
+        )
+
+        self.model_ = self._run_training_loop(self.model_, train_loader, val_loader)
+        self.fitted_ = True
+        return self
+
+    def predict(self, X_test: np.ndarray) -> np.ndarray:
+
+        X_scaled = self._apply_scaler(X_test)
+        X_tensor = torch.tensor(X_scaled, dtype=torch.float32)
+
+        self.model_.eval()
+        with torch.no_grad():
+            y_hat, _ = self.model_(X_tensor)
+
+        y_pred = y_hat.squeeze(1).numpy()
+        print(f"  y_pred mean={y_pred.mean():.6f}, std={y_pred.std():.6f}")
+        return y_pred
+
+    def get_attention(self, X_test: np.ndarray) -> np.ndarray:
+
+        X_scaled = self._apply_scaler(X_test)
+        X_tensor = torch.tensor(X_scaled, dtype=torch.float32)
+
+        self.model_.eval()
+        with torch.no_grad():
+            _, A = self.model_(X_tensor)
+
+        return A.numpy()
