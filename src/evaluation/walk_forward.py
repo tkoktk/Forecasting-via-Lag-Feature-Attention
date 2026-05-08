@@ -4,45 +4,43 @@ from src.evaluation.metrics import compute_metrics
 
 
 def walk_forward(
-    X, y, dates, forecaster_cls, config, eval_start, eval_end, horizon, step
+    X, y, dates, forecaster_cls, config, splitter, inner_splitter=None, verbose=False
 ):
     dates = pd.DatetimeIndex(dates)
-    eval_mask = (dates >= eval_start) & (dates <= eval_end)
-    eval_dates = dates[eval_mask]
-
-    if len(eval_dates) == 0:
-        raise ValueError(f"No samples found between {eval_start} and {eval_end}")
-
     fold_results = []
 
-    for i in range(0, len(eval_dates), step):
-        block_dates = eval_dates[i : i + step]
-        first_test_date = block_dates[0]
+    for fold in splitter.split(dates):
+        X_train = X[fold.train_idx]
+        y_train = y[fold.train_idx]
+        X_test = X[fold.test_idx]
+        y_test = y[fold.test_idx]
+        test_dates_block = dates[fold.test_idx]
 
-        train_mask = dates < first_test_date
-        X_train = X[train_mask]
-        y_train = y[train_mask]
+        if verbose:
+            print(
+                f"fold {fold.fold_id} | n_train={fold.n_train}, n_test={fold.n_test}, "
+                f"n_purged={fold.n_purged} | test_start={fold.test_start_date.date()}"
+            )
 
-        test_mask = np.isin(dates, block_dates)
-        X_test = X[test_mask]
-        y_test = y[test_mask]
-        test_dates_block = dates[test_mask]
-
-        print(
-            f"fold {i // step + 1} | train={len(X_train)}, test={len(X_test)}, first_test={first_test_date.date()}"
-        )
-
-        if len(X_train) == 0:
-            print(f"Skipping fold. No training data before {first_test_date.date()}")
-            continue
-
-        # We can take a given forecaster and then fit it on our train data
         forecaster = forecaster_cls(config)
-        forecaster.fit(X_train, y_train)
+
+        if inner_splitter is None:
+            forecaster.fit(X_train, y_train)
+
+        else:  # If we are using a model that uses early stopping:
+            inner_train_idx, val_idx = inner_splitter.split(fold.n_train)
+            forecaster.fit(
+                X_train[inner_train_idx],
+                y_train[inner_train_idx],
+                X_val=X_train[val_idx],
+                y_val=y_train[val_idx],
+            )
+
         y_pred = forecaster.predict(X_test)
 
         fold_results.append(
             {
+                "fold_id": fold.fold_id,
                 "dates": test_dates_block,
                 "y_true": y_test,
                 "y_pred": y_pred,

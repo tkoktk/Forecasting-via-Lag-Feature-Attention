@@ -113,18 +113,25 @@ class AttentionForecaster(Forecaster):
         print(f"  training complete | best_val_loss={best_val_loss:.6f}")
         return model
 
-    def fit(self, X_train: np.ndarray, y_train: np.ndarray) -> "AttentionForecaster":
+    def fit(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_val: np.ndarray = None,
+        y_val: np.ndarray = None,
+    ) -> "AttentionForecaster":
 
         n, L, F = X_train.shape
 
-        X_tr, X_val, y_tr, y_val = self._time_split(X_train, y_train)
+        self.scaler_ = self._fit_scaler(X_train)
+        X_train_scaled = self._apply_scaler(X_train)
+        train_loader = self._make_dataloader(X_train_scaled, y_train)
 
-        self.scaler_ = self._fit_scaler(X_tr)
-        X_tr_scaled = self._apply_scaler(X_tr)
-        X_val_scaled = self._apply_scaler(X_val)
-
-        train_loader = self._make_dataloader(X_tr_scaled, y_tr)
-        val_loader = self._make_dataloader(X_val_scaled, y_val)
+        if X_val is not None:
+            X_val_scaled = self._apply_scaler(X_val)
+            val_loader = self._make_dataloader(X_val_scaled, y_val)
+        else:
+            val_loader = None
 
         torch.manual_seed(SEED)
         self.model_ = LagFeatureForecaster(
